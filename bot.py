@@ -36,6 +36,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "8492424383:AAFoAmLdvquiP0JwFUYE2grgyF2d2zQRE
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "8283067497").split(",") if x.strip()]
 PORT = int(os.getenv("PORT", 10000))  # Render avtomatik PORT beradi
 
+# --- Oylik obuna narxlari va karta ma'lumotlari ---
+# Bularni Render -> Environment bo'limida ham sozlashingiz mumkin (yoki shu yerda o'zgartiring).
+CARD_NUMBER = os.getenv("CARD_NUMBER", "8600 0000 0000 0000")   # <-- to'lov qabul qilinadigan karta
+CARD_HOLDER = os.getenv("CARD_HOLDER", "F.I.SH")                # <-- karta egasining ismi
+VIP_PRICE = int(os.getenv("VIP_PRICE", "15000"))                # so'm / oy
+PREMIUM_PRICE = int(os.getenv("PREMIUM_PRICE", "25000"))        # so'm / oy
+SUBSCRIPTION_DAYS = 30                                           # obuna necha kunlik
+
 # ============================
 # 2. SQLite BAZA (DB)
 # ============================
@@ -108,7 +116,28 @@ def init_db():
         value TEXT
     )''')
 
+    # To'lov so'rovlari jadvali (karta orqali qo'lda tasdiqlanadigan obunalar)
+    c.execute('''CREATE TABLE IF NOT EXISTS payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        plan TEXT,
+        amount INTEGER,
+        screenshot_file_id TEXT,
+        status TEXT DEFAULT 'pending',
+        requested_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        decided_at TEXT,
+        decided_by INTEGER
+    )''')
+
     conn.commit()
+
+    # Eski bazalarda mavjud bo'lmasa, obuna muddati ustunini qo'shamiz (xavfsiz migratsiya)
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN subscription_expires_at TEXT DEFAULT NULL")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # ustun allaqachon mavjud
+
     conn.close()
 
 init_db()
@@ -154,9 +183,30 @@ def add_user(user_id, username, first_name, last_name, referrer_id=None):
                    (username, first_name, last_name, user_id), commit=True)
 
 def get_user_status(user_id):
-    """Foydalanuvchi statusini qaytaradi: oddiy / vip / premium / admin"""
-    row = db_execute("SELECT status FROM users WHERE user_id=?", (user_id,), fetchone=True)
-    return row[0] if row else "oddiy"
+    """Foydalanuvchi statusini qaytaradi: oddiy / vip / premium / admin.
+    Agar VIP/PREMIUM muddati tugagan bo'lsa, avtomatik 'oddiy'ga tushiriladi."""
+    row = db_execute("SELECT status, subscription_expires_at FROM users WHERE user_id=?", (user_id,), fetchone=True)
+    if not row:
+        return "oddiy"
+    status, expires_at = row
+    if status in ("vip", "premium") and expires_at:
+        if datetime.now() > datetime.fromisoformat(expires_at):
+            set_user_status(user_id, "oddiy")
+            db_execute("UPDATE users SET subscription_expires_at=NULL WHERE user_id=?", (user_id,), commit=True)
+            log_action(user_id, "subscription_expired", f"was={status}")
+            return "oddiy"
+    return status
+
+def get_subscription_expiry(user_id):
+    row = db_execute("SELECT subscription_expires_at FROM users WHERE user_id=?", (user_id,), fetchone=True)
+    return row[0] if row and row[0] else None
+
+def activate_subscription(user_id, plan):
+    """Foydalanuvchiga vip/premium statusni SUBSCRIPTION_DAYS kunga faollashtiradi"""
+    expires = (datetime.now() + timedelta(days=SUBSCRIPTION_DAYS)).isoformat()
+    set_user_status(user_id, plan)
+    db_execute("UPDATE users SET subscription_expires_at=? WHERE user_id=?", (expires, user_id), commit=True)
+    return expires
 
 def set_user_status(user_id, status):
     db_execute("UPDATE users SET status=? WHERE user_id=?", (status, user_id), commit=True)
@@ -261,6 +311,38 @@ def search_movies(query):
     )
 
 # ------------------------------
+# To'lovlar (obuna) bilan bog'liq funksiyalar
+# ------------------------------
+def create_payment(user_id, plan, amount, screenshot_file_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO payments (user_id, plan, amount, screenshot_file_id) VALUES (?, ?, ?, ?)",
+        (user_id, plan, amount, screenshot_file_id)
+    )
+    conn.commit()
+    payment_id = c.lastrowid
+    conn.close()
+    return payment_id
+
+def get_payment(payment_id):
+    return db_execute("SELECT * FROM payments WHERE id=?", (payment_id,), fetchone=True)
+
+def set_payment_status(payment_id, status, decided_by):
+    db_execute(
+        "UPDATE payments SET status=?, decided_at=?, decided_by=? WHERE id=?",
+        (status, datetime.now().isoformat(), decided_by, payment_id),
+        commit=True
+    )
+
+def has_pending_payment(user_id):
+    row = db_execute("SELECT id FROM payments WHERE user_id=? AND status='pending'", (user_id,), fetchone=True)
+    return row is not None
+
+def get_pending_payments():
+    return db_execute("SELECT id, user_id, plan, amount, requested_at FROM payments WHERE status='pending' ORDER BY requested_at ASC", fetchall=True)
+
+# ------------------------------
 # Majburiy obuna kanallari (DB orqali doimiy saqlanadi)
 # ------------------------------
 def get_channels():
@@ -315,6 +397,7 @@ class AdminStates(StatesGroup):
     waiting_remove_channel = State()
     waiting_search_query = State()
     waiting_ban_user = State()
+    waiting_payment_screenshot = State()
 
 # ============================
 # 6. KLAVIATURALAR
@@ -326,6 +409,7 @@ def main_reply_keyboard():
     builder.button(text="🏆 Top kinolar")
     builder.button(text="🆕 Yangi kinolar")
     builder.button(text="🎁 Bonus")
+    builder.button(text="💳 Obuna")
     builder.button(text="👤 Profil")
     builder.button(text="📂 Kategoriyalar")
     builder.adjust(2)
@@ -339,6 +423,7 @@ def main_inline_keyboard(user_id):
     builder.button(text="🏆 Top kinolar", callback_data="top_movies")
     builder.button(text="🆕 Yangi kinolar", callback_data="new_movies")
     builder.button(text="🎁 Bonus", callback_data="bonus_menu")
+    builder.button(text="💳 Obuna sotib olish", callback_data="subscription_menu")
     builder.button(text="👤 Profil", callback_data="profile")
     builder.button(text="📂 Kategoriyalar", callback_data="categories_menu")
     if status in ["vip", "premium", "admin"]:
@@ -356,6 +441,7 @@ def admin_panel_keyboard():
     builder.button(text="📢 Broadcast", callback_data="admin_broadcast")
     builder.button(text="👑 Status berish", callback_data="admin_give_status")
     builder.button(text="👑 Status olib tashlash", callback_data="admin_remove_status")
+    builder.button(text="💳 To'lov so'rovlari", callback_data="admin_payments")
     builder.button(text="📡 Kanal sozlash", callback_data="admin_channels")
     builder.button(text="📋 Foydalanuvchilar", callback_data="admin_users")
     builder.button(text="🚫 Ban qilish", callback_data="admin_ban")
@@ -419,6 +505,26 @@ def subscribe_keyboard():
         builder.button(text=f"📢 Obuna bo'lish: {ch}", url=f"https://t.me/{ch.lstrip('@')}")
     builder.adjust(1)
     builder.row(InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_subscription"))
+    return builder.as_markup()
+
+def subscription_plans_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text=f"👑 VIP — {VIP_PRICE:,} so'm/oy".replace(",", " "), callback_data="buy_vip")
+    builder.button(text=f"💎 PREMIUM — {PREMIUM_PRICE:,} so'm/oy".replace(",", " "), callback_data="buy_premium")
+    builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_main"))
+    return builder.as_markup()
+
+def payment_cancel_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Bekor qilish", callback_data="subscription_menu")
+    return builder.as_markup()
+
+def payment_admin_keyboard(payment_id):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Tasdiqlash", callback_data=f"approve_pay_{payment_id}")
+    builder.button(text="❌ Rad etish", callback_data=f"reject_pay_{payment_id}")
+    builder.adjust(2)
     return builder.as_markup()
 
 def channel_settings_keyboard():
@@ -497,7 +603,7 @@ async def check_subscription_callback(call: CallbackQuery):
     await call.answer()
 
 # ---------- Reply menyu tugmalari ----------
-@dp.message(F.text.in_(["🎬 Kinolar", "🔍 Qidirish", "🏆 Top kinolar", "🆕 Yangi kinolar", "🎁 Bonus", "👤 Profil", "📂 Kategoriyalar"]))
+@dp.message(F.text.in_(["🎬 Kinolar", "🔍 Qidirish", "🏆 Top kinolar", "🆕 Yangi kinolar", "🎁 Bonus", "💳 Obuna", "👤 Profil", "📂 Kategoriyalar"]))
 async def reply_menu_handler(message: Message, state: FSMContext):
     try:
         user_id = message.from_user.id
@@ -543,6 +649,15 @@ async def reply_menu_handler(message: Message, state: FSMContext):
         elif text == "🎁 Bonus":
             await message.answer("🎁 Bonus menyusi:", reply_markup=bonus_keyboard())
 
+        elif text == "💳 Obuna":
+            await message.answer(
+                "💳 <b>Obuna rejalarini tanlang:</b>\n\n"
+                f"👑 VIP — {VIP_PRICE:,} so'm/oy\n".replace(",", " ") +
+                f"💎 PREMIUM — {PREMIUM_PRICE:,} so'm/oy\n".replace(",", " "),
+                parse_mode="HTML",
+                reply_markup=subscription_plans_keyboard()
+            )
+
         elif text == "👤 Profil":
             await message.answer(profile_text(user_id), parse_mode="HTML")
 
@@ -558,16 +673,17 @@ async def reply_menu_handler(message: Message, state: FSMContext):
 
 def profile_text(user_id):
     """Profil matnini shakllantiruvchi yordamchi funksiya"""
+    status = get_user_status(user_id)  # bu yerda avtomatik muddat tekshiruvi ham amalga oshadi
     user = db_execute(
-        "SELECT username, first_name, status, total_requests, bonus_balance FROM users WHERE user_id=?",
+        "SELECT username, first_name, total_requests, bonus_balance FROM users WHERE user_id=?",
         (user_id,), fetchone=True
     )
     if not user:
         return "❌ Ma'lumot topilmadi."
-    username, first_name, status, total_requests, bonus = user
+    username, first_name, total_requests, bonus = user
     status_emoji = {"oddiy": "👤", "vip": "👑", "premium": "💎", "admin": "⚙️"}.get(status, "👤")
     username_display = username or "yo\u02bcq"
-    return (
+    text = (
         f"👤 <b>Sizning profilingiz:</b>\n\n"
         f"Ism: {first_name}\n"
         f"Username: @{username_display}\n"
@@ -575,6 +691,12 @@ def profile_text(user_id):
         f"So'rovlar soni: {total_requests}\n"
         f"Bonus balans: {bonus} ball"
     )
+    if status in ("vip", "premium"):
+        expires_at = get_subscription_expiry(user_id)
+        if expires_at:
+            expires_date = datetime.fromisoformat(expires_at).strftime("%d.%m.%Y")
+            text += f"\n📅 Obuna tugash sanasi: {expires_date}"
+    return text
 
 # ---------- Qidiruv so'rovi ----------
 @dp.message(AdminStates.waiting_search_query)
@@ -832,6 +954,192 @@ async def profile_callback(call: CallbackQuery):
         await call.message.edit_text(profile_text(call.from_user.id), parse_mode="HTML", reply_markup=main_inline_keyboard(call.from_user.id))
     except Exception as e:
         logging.exception(f"Profil xatosi: {e}")
+    await call.answer()
+
+# ---------- Obuna (VIP/PREMIUM) sotib olish ----------
+@dp.callback_query(F.data == "subscription_menu")
+async def subscription_menu(call: CallbackQuery, state: FSMContext):
+    try:
+        await state.clear()
+        vip_line = f"👑 VIP — {VIP_PRICE:,} so'm/oy".replace(",", " ")
+        premium_line = f"💎 PREMIUM — {PREMIUM_PRICE:,} so'm/oy".replace(",", " ")
+        await call.message.edit_text(
+            f"💳 <b>Obuna rejalarini tanlang:</b>\n\n{vip_line}\n{premium_line}\n\n"
+            f"👑 VIP: maxsus VIP kinolarga kirish\n"
+            f"💎 PREMIUM: barcha maxsus kinolarga to'liq kirish",
+            parse_mode="HTML",
+            reply_markup=subscription_plans_keyboard()
+        )
+    except Exception as e:
+        logging.exception(f"Obuna menyusi xatosi: {e}")
+    await call.answer()
+
+@dp.callback_query(F.data.in_(["buy_vip", "buy_premium"]))
+async def buy_plan(call: CallbackQuery, state: FSMContext):
+    try:
+        user_id = call.from_user.id
+        if has_pending_payment(user_id):
+            await call.answer("⏳ Sizda hali ko'rib chiqilayotgan to'lov so'rovi bor. Admin javobini kuting.", show_alert=True)
+            return
+        plan = "vip" if call.data == "buy_vip" else "premium"
+        amount = VIP_PRICE if plan == "vip" else PREMIUM_PRICE
+        plan_title = "👑 VIP" if plan == "vip" else "💎 PREMIUM"
+        await state.update_data(plan=plan, amount=amount)
+        await state.set_state(AdminStates.waiting_payment_screenshot)
+        await call.message.edit_text(
+            f"{plan_title} obunasi — {amount:,} so'm/oy".replace(",", " ") + "\n\n"
+            f"💳 Quyidagi kartaga to'lov qiling:\n"
+            f"<code>{CARD_NUMBER}</code>\n"
+            f"👤 Karta egasi: {CARD_HOLDER}\n\n"
+            f"✅ To'lovni amalga oshirgach, to'lov chekining <b>screenshot (rasm)</b>ini shu yerga yuboring.\n"
+            f"Admin tekshirib, obunangizni faollashtiradi.",
+            parse_mode="HTML",
+            reply_markup=payment_cancel_keyboard()
+        )
+    except Exception as e:
+        logging.exception(f"Obuna tanlash xatosi: {e}")
+    await call.answer()
+
+@dp.message(AdminStates.waiting_payment_screenshot, F.photo)
+async def receive_payment_screenshot(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        plan = data.get("plan")
+        amount = data.get("amount")
+        if not plan:
+            await message.answer("❌ Xatolik: reja tanlanmagan. Qaytadan /start bosing.")
+            await state.clear()
+            return
+
+        screenshot_file_id = message.photo[-1].file_id
+        user_id = message.from_user.id
+        payment_id = create_payment(user_id, plan, amount, screenshot_file_id)
+        log_action(user_id, "payment_request", f"plan={plan} amount={amount} payment_id={payment_id}")
+
+        await message.answer(
+            "✅ To'lov so'rovingiz qabul qilindi!\n"
+            "⏳ Admin tekshirib, tez orada obunangizni faollashtiradi. Iltimos, kuting."
+        )
+
+        plan_title = "👑 VIP" if plan == "vip" else "💎 PREMIUM"
+        username = message.from_user.username
+        username_display = username or "yo\u02bcq"
+        caption = (
+            f"💳 <b>Yangi to'lov so'rovi</b> (#{payment_id})\n\n"
+            f"👤 Foydalanuvchi: {message.from_user.first_name} (@{username_display})\n"
+            f"🆔 ID: <code>{user_id}</code>\n"
+            f"📦 Reja: {plan_title}\n"
+            f"💰 Summasi: {amount:,} so'm".replace(",", " ")
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_photo(
+                    admin_id, screenshot_file_id, caption=caption,
+                    parse_mode="HTML", reply_markup=payment_admin_keyboard(payment_id)
+                )
+            except Exception:
+                pass
+
+        await state.clear()
+    except Exception as e:
+        logging.exception(f"To'lov skrinshoti xatosi: {e}")
+        await message.answer("❌ Xatolik yuz berdi. Qaytadan urinib ko'ring.")
+        await state.clear()
+
+@dp.message(AdminStates.waiting_payment_screenshot)
+async def receive_payment_screenshot_invalid(message: Message):
+    """Agar foydalanuvchi rasm o'rniga boshqa narsa yuborsa"""
+    await message.answer("❗️ Iltimos, to'lov chekining rasm (screenshot) ko'rinishida yuboring.")
+
+@dp.callback_query(F.data.startswith("approve_pay_"))
+async def approve_payment(call: CallbackQuery):
+    try:
+        if call.from_user.id not in ADMIN_IDS:
+            await call.answer("⛔️ Ruxsat yo'q", show_alert=True)
+            return
+        payment_id = int(call.data.split("_")[-1])
+        payment = get_payment(payment_id)
+        if not payment:
+            await call.answer("❌ To'lov topilmadi.", show_alert=True)
+            return
+        if payment[5] != "pending":
+            await call.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
+            return
+
+        _, user_id, plan, amount, _, _, _, _, _ = payment
+        expires_at = activate_subscription(user_id, plan)
+        set_payment_status(payment_id, "approved", call.from_user.id)
+        log_action(call.from_user.id, "approve_payment", f"payment_id={payment_id} user={user_id} plan={plan}")
+
+        expires_date = datetime.fromisoformat(expires_at).strftime("%d.%m.%Y")
+        plan_title = "👑 VIP" if plan == "vip" else "💎 PREMIUM"
+        try:
+            await bot.send_message(
+                user_id,
+                f"✅ To'lovingiz tasdiqlandi!\n{plan_title} obunangiz faollashtirildi.\n"
+                f"📅 Amal qilish muddati: {expires_date} gacha"
+            )
+        except Exception:
+            pass
+
+        await call.message.edit_caption(caption=call.message.caption + "\n\n✅ <b>TASDIQLANDI</b>", parse_mode="HTML")
+    except Exception as e:
+        logging.exception(f"To'lov tasdiqlash xatosi: {e}")
+        await call.answer("Xatolik yuz berdi.", show_alert=True)
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("reject_pay_"))
+async def reject_payment(call: CallbackQuery):
+    try:
+        if call.from_user.id not in ADMIN_IDS:
+            await call.answer("⛔️ Ruxsat yo'q", show_alert=True)
+            return
+        payment_id = int(call.data.split("_")[-1])
+        payment = get_payment(payment_id)
+        if not payment:
+            await call.answer("❌ To'lov topilmadi.", show_alert=True)
+            return
+        if payment[5] != "pending":
+            await call.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
+            return
+
+        user_id = payment[1]
+        set_payment_status(payment_id, "rejected", call.from_user.id)
+        log_action(call.from_user.id, "reject_payment", f"payment_id={payment_id} user={user_id}")
+
+        try:
+            await bot.send_message(
+                user_id,
+                "❌ To'lovingiz tasdiqlanmadi.\n"
+                "Iltimos, to'lov chekini tekshirib qaytadan urinib ko'ring yoki admin bilan bog'laning."
+            )
+        except Exception:
+            pass
+
+        await call.message.edit_caption(caption=call.message.caption + "\n\n❌ <b>RAD ETILDI</b>", parse_mode="HTML")
+    except Exception as e:
+        logging.exception(f"To'lov rad etish xatosi: {e}")
+        await call.answer("Xatolik yuz berdi.", show_alert=True)
+    await call.answer()
+
+@dp.callback_query(F.data == "admin_payments")
+async def admin_payments(call: CallbackQuery):
+    try:
+        if call.from_user.id not in ADMIN_IDS:
+            await call.answer("⛔️ Ruxsat yo'q", show_alert=True)
+            return
+        pending = get_pending_payments()
+        if not pending:
+            await call.message.edit_text("💳 Hozircha kutilayotgan to'lov so'rovlari yo'q.", reply_markup=admin_panel_keyboard())
+            return
+        text = "💳 <b>Kutilayotgan to'lovlar:</b>\n\n"
+        for pid, user_id, plan, amount, requested_at in pending:
+            plan_title = "👑 VIP" if plan == "vip" else "💎 PREMIUM"
+            text += f"#{pid} — ID: <code>{user_id}</code> — {plan_title} — {amount:,} so'm".replace(",", " ") + "\n"
+        text += "\nHar bir so'rov skrinshoti bilan alohida xabar qilib yuborilgan — o'sha yerdan tasdiqlang/rad eting."
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=admin_panel_keyboard())
+    except Exception as e:
+        logging.exception(f"Admin to'lovlar ro'yxati xatosi: {e}")
     await call.answer()
 
 # ---------- Admin panel ----------
