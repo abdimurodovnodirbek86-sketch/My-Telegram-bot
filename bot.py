@@ -31,7 +31,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 # ============================
 # Render'da bu qiymatlar Dashboard -> Environment bo'limidan kiritiladi.
 # Lokal (Termux) test uchun pastdagi standart qiymatlarni o'zgartirishingiz mumkin.
-BOT_TOKEN = os.getenv("8813683325:AAHBurAExJRYr-WJGREAe_bkGENtwkYTXW4", "YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN = os.getenv("8492424383:AAFoAmLdvquiP0JwFUYE2grgyF2d2zQREUA ", "YOUR_BOT_TOKEN_HERE")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "8283067497").split(",") if x.strip()]
 PORT = int(os.getenv("PORT", 10000))  # Render avtomatik PORT beradi
 
