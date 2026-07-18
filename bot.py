@@ -13,7 +13,7 @@ import random
 from datetime import datetime, timedelta
 from typing import List, Tuple
 
-from aiohttp import web
+from aiohttp import web, ClientSession, ClientTimeout
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandObject
@@ -1849,6 +1849,22 @@ async def daily_admin_report_loop():
         except Exception as e:
             logging.exception(f"Kunlik hisobot xatosi: {e}")
 
+async def self_ping_loop():
+    """Render bepul instansi uxlab qolmasligi uchun bot o'zi o'ziga har 5 daqiqada so'rov yuboradi.
+    Render avtomatik beradigan RENDER_EXTERNAL_URL dan foydalanadi (yoki SELF_URL orqali qo'lda sozlash mumkin)."""
+    self_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL")
+    if not self_url:
+        logging.info("ℹ️ SELF_URL/RENDER_EXTERNAL_URL topilmadi — o'z-o'zini uyg'otish o'chirilgan.")
+        return
+    async with ClientSession() as session:
+        while True:
+            await asyncio.sleep(5 * 60)  # har 5 daqiqada
+            try:
+                async with session.get(self_url, timeout=ClientTimeout(total=20)) as resp:
+                    logging.info(f"🔁 Self-ping: {resp.status}")
+            except Exception as e:
+                logging.warning(f"Self-ping xatosi: {e}")
+
 # ============================
 # 12. BOTNI ISHGA TUSHIRISH
 # ============================
@@ -1858,6 +1874,7 @@ async def main():
     await start_web_server()
     asyncio.create_task(subscription_reminder_loop())
     asyncio.create_task(daily_admin_report_loop())
+    asyncio.create_task(self_ping_loop())
     await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
