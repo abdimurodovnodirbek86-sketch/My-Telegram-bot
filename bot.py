@@ -31,7 +31,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 # ============================
 # Render'da bu qiymatlar Dashboard -> Environment bo'limidan kiritiladi.
 # Lokal (Termux) test uchun pastdagi standart qiymatlarni o'zgartirishingiz mumkin.
-BOT_TOKEN = os.getenv("8492424383:AAFoAmLdvquiP0JwFUYE2grgyF2d2zQREUA ", "YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN = os.getenv("8492424383:AAFoAmLdvquiP0JwFUYE2grgyF2d2zQREUA", "YOUR_BOT_TOKEN_HERE")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "8283067497").split(",") if x.strip()]
 PORT = int(os.getenv("PORT", 10000))  # Render avtomatik PORT beradi
 
@@ -565,10 +565,11 @@ def profile_text(user_id):
         return "❌ Ma'lumot topilmadi."
     username, first_name, status, total_requests, bonus = user
     status_emoji = {"oddiy": "👤", "vip": "👑", "premium": "💎", "admin": "⚙️"}.get(status, "👤")
+    username_display = username or "yo\u02bcq"
     return (
         f"👤 <b>Sizning profilingiz:</b>\n\n"
         f"Ism: {first_name}\n"
-        f"Username: @{username or 'yo\u02bcq'}\n"
+        f"Username: @{username_display}\n"
         f"Status: {status_emoji} {status}\n"
         f"So'rovlar soni: {total_requests}\n"
         f"Bonus balans: {bonus} ball"
@@ -938,13 +939,15 @@ async def admin_add_movie_premium(message: Message, state: FSMContext):
             data["code"], data["title"], data["desc"], data["file_id"],
             data["category"], data["vip"], premium, message.from_user.id
         )
+        vip_display = "Ha" if data["vip"] else "Yo\u02bcq"
+        premium_display = "Ha" if premium else "Yo\u02bcq"
         await message.answer(
             f"✅ Kino muvaffaqiyatli qo'shildi!\n\n"
             f"🔑 Kod: {data['code']}\n"
             f"🎬 Nomi: {data['title']}\n"
             f"📂 Kategoriya: {data['category']}\n"
-            f"👑 VIP: {'Ha' if data['vip'] else 'Yo\u02bcq'}\n"
-            f"💎 PREMIUM: {'Ha' if premium else 'Yo\u02bcq'}"
+            f"👑 VIP: {vip_display}\n"
+            f"💎 PREMIUM: {premium_display}"
         )
         log_action(message.from_user.id, "add_movie", f"code={data['code']}")
         await state.clear()
