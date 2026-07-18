@@ -414,7 +414,12 @@ CHANNELS = get_channels()  # Bot ishga tushganda bazadan kanal ro'yxati yuklanad
 # 4. OBUNA TEKSHIRISH FUNKSIYASI
 # ============================
 async def is_subscribed(user_id: int, bot: Bot) -> bool:
-    """Foydalanuvchi barcha majburiy kanallarga obuna bo'lganmi tekshiradi"""
+    """Foydalanuvchi barcha majburiy kanallarga obuna bo'lganmi tekshiradi.
+    Adminlar va pullik VIP/PREMIUM obunachilar bu tekshiruvdan ozod qilinadi."""
+    if user_id in ADMIN_IDS:
+        return True
+    if get_user_status(user_id) in ("vip", "premium"):
+        return True
     if not CHANNELS:
         return True
     for channel in CHANNELS:
@@ -422,7 +427,9 @@ async def is_subscribed(user_id: int, bot: Bot) -> bool:
             member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
             if member.status not in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
                 return False
-        except Exception:
+        except Exception as e:
+            # Botning o'zi kanalda admin bo'lmasa yoki kanal noto'g'ri kiritilgan bo'lsa shu yerga tushadi
+            logging.warning(f"Obuna tekshiruvi xatosi (kanal={channel}, user={user_id}): {e}")
             return False
     return True
 
