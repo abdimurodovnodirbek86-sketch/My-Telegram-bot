@@ -33,7 +33,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 # Render'da bu qiymatlarni Dashboard -> Environment bo'limidan ham boshqarish mumkin
 # (agar shu yerda environment variable topilmasa, pastdagi standart qiymat ishlatiladi).
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8492424383:AAFoAmLdvquiP0JwFUYE2grgyF2d2zQREUA")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "8283067497").split(",") if x.strip()]
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "8283067497,5153285706").split(",") if x.strip()]
 PORT = int(os.getenv("PORT", 10000))  # Render avtomatik PORT beradi
 
 # --- Oylik obuna narxlari va karta ma'lumotlari ---
@@ -43,6 +43,14 @@ CARD_HOLDER = os.getenv("CARD_HOLDER", "F.I.SH")                # <-- karta egas
 VIP_PRICE = int(os.getenv("VIP_PRICE", "15000"))                # so'm / oy
 PREMIUM_PRICE = int(os.getenv("PREMIUM_PRICE", "25000"))        # so'm / oy
 SUBSCRIPTION_DAYS = 30                                           # obuna necha kunlik
+
+# --- Referal mukofoti: N kishini taklif qilgan foydalanuvchiga bepul VIP ---
+REFERRAL_TARGET_COUNT = 5                                         # necha kishi taklif qilinsa
+REFERRAL_REWARD_DAYS = 15                                         # necha kunlik bepul VIP beriladi
+REFERRAL_REWARD_PLAN = "vip"                                      # qaysi status beriladi
+
+# --- Yangi kino qo'shilganda avtomatik e'lon qilinadigan kanal (ixtiyoriy) ---
+POST_CHANNEL = os.getenv("POST_CHANNEL", "")                      # masalan: @kino_yangiliklari
 
 # ============================
 # 2. SQLite BAZA (DB)
@@ -131,12 +139,20 @@ def init_db():
 
     conn.commit()
 
-    # Eski bazalarda mavjud bo'lmasa, obuna muddati ustunini qo'shamiz (xavfsiz migratsiya)
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN subscription_expires_at TEXT DEFAULT NULL")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # ustun allaqachon mavjud
+    # Eski bazalarda mavjud bo'lmasa, kerakli ustunlarni qo'shamiz (xavfsiz migratsiya)
+    migrations = [
+        "ALTER TABLE users ADD COLUMN subscription_expires_at TEXT DEFAULT NULL",
+        "ALTER TABLE users ADD COLUMN referral_reward_claimed BOOLEAN DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN reminder_sent BOOLEAN DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'uz'",
+        "ALTER TABLE movies ADD COLUMN poster_file_id TEXT DEFAULT NULL",
+    ]
+    for m in migrations:
+        try:
+            c.execute(m)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # ustun allaqachon mavjud
 
     conn.close()
 
@@ -201,12 +217,40 @@ def get_subscription_expiry(user_id):
     row = db_execute("SELECT subscription_expires_at FROM users WHERE user_id=?", (user_id,), fetchone=True)
     return row[0] if row and row[0] else None
 
-def activate_subscription(user_id, plan):
-    """Foydalanuvchiga vip/premium statusni SUBSCRIPTION_DAYS kunga faollashtiradi"""
-    expires = (datetime.now() + timedelta(days=SUBSCRIPTION_DAYS)).isoformat()
+def activate_subscription(user_id, plan, days=None):
+    """Foydalanuvchiga vip/premium statusni belgilangan kunga faollashtiradi.
+    Agar mavjud faol obuna bo'lsa, muddatga qo'shib (uzaytirib) beriladi."""
+    days = days or SUBSCRIPTION_DAYS
+    current_expiry = get_subscription_expiry(user_id)
+    base = datetime.now()
+    if current_expiry:
+        try:
+            existing = datetime.fromisoformat(current_expiry)
+            if existing > base:
+                base = existing  # mavjud muddat ustiga qo'shamiz
+        except ValueError:
+            pass
+    expires = (base + timedelta(days=days)).isoformat()
     set_user_status(user_id, plan)
-    db_execute("UPDATE users SET subscription_expires_at=? WHERE user_id=?", (expires, user_id), commit=True)
+    db_execute("UPDATE users SET subscription_expires_at=?, reminder_sent=0 WHERE user_id=?", (expires, user_id), commit=True)
     return expires
+
+def get_referral_count(user_id):
+    row = db_execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (user_id,), fetchone=True)
+    return row[0] if row else 0
+
+def check_and_grant_referral_reward(referrer_id):
+    """REFERRAL_TARGET_COUNT kishini taklif qilgan foydalanuvchiga bir martalik bepul obuna beradi.
+    Mukofot berilsa True, aks holda False qaytaradi."""
+    row = db_execute("SELECT referral_reward_claimed FROM users WHERE user_id=?", (referrer_id,), fetchone=True)
+    if not row or row[0]:
+        return False
+    if get_referral_count(referrer_id) < REFERRAL_TARGET_COUNT:
+        return False
+    activate_subscription(referrer_id, REFERRAL_REWARD_PLAN, days=REFERRAL_REWARD_DAYS)
+    db_execute("UPDATE users SET referral_reward_claimed=1 WHERE user_id=?", (referrer_id,), commit=True)
+    log_action(referrer_id, "referral_reward", f"count={REFERRAL_TARGET_COUNT} days={REFERRAL_REWARD_DAYS}")
+    return True
 
 def set_user_status(user_id, status):
     db_execute("UPDATE users SET status=? WHERE user_id=?", (status, user_id), commit=True)
@@ -265,15 +309,21 @@ def log_action(user_id, action, details=""):
 # ------------------------------
 # Kinolar bilan bog'liq funksiyalar
 # ------------------------------
-def add_movie(code, title, description, file_id, category, is_vip=False, is_premium=False, added_by=0):
+def add_movie(code, title, description, file_id, category, is_vip=False, is_premium=False, added_by=0, poster_file_id=None):
     db_execute(
-        "INSERT OR REPLACE INTO movies (code, title, description, file_id, category, is_vip, is_premium, added_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (code, title, description, file_id, category, is_vip, is_premium, added_by),
+        "INSERT OR REPLACE INTO movies (code, title, description, file_id, category, is_vip, is_premium, added_by, poster_file_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (code, title, description, file_id, category, is_vip, is_premium, added_by, poster_file_id),
         commit=True
     )
 
 def get_movie(code):
     return db_execute("SELECT * FROM movies WHERE code=?", (code,), fetchone=True)
+
+def get_next_suggested_code():
+    """Mavjud kodlar orasidan eng katta raqamli kodni topib, +1 taklif qiladi"""
+    codes = db_execute("SELECT code FROM movies", fetchall=True)
+    numeric = [int(c[0]) for c in codes if c[0].isdigit()]
+    return str(max(numeric) + 1) if numeric else "101"
 
 def delete_movie(code):
     db_execute("DELETE FROM movies WHERE code=?", (code,), commit=True)
@@ -383,6 +433,7 @@ class AdminStates(StatesGroup):
     waiting_movie_code = State()
     waiting_movie_title = State()
     waiting_movie_desc = State()
+    waiting_movie_poster = State()
     waiting_movie_file = State()
     waiting_movie_category = State()
     waiting_movie_vip = State()
@@ -475,9 +526,12 @@ def category_list_keyboard(categories):
     builder.row(InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_main"))
     return builder.as_markup()
 
-def movie_action_keyboard(code):
+def movie_action_keyboard(code, share_link=None):
     builder = InlineKeyboardBuilder()
     builder.button(text="⭐️ Baholash", callback_data=f"rate_{code}")
+    if share_link:
+        share_url = f"https://t.me/share/url?url={share_link}&text=Bu%20kinoni%20ko'ring!"
+        builder.button(text="📤 Ulashish", url=share_url)
     builder.button(text="🔙 Orqaga", callback_data="movies_menu")
     builder.adjust(2)
     return builder.as_markup()
@@ -549,23 +603,55 @@ dp = Dispatcher(storage=storage)
 # ---------- /start komandasi ----------
 @dp.message(Command("start"))
 async def start_command(message: Message, command: CommandObject, state: FSMContext):
-    """Botni ishga tushiruvchi asosiy komanda. Referal linkni ham qabul qiladi: /start <referrer_id>"""
+    """Botni ishga tushiruvchi asosiy komanda.
+    Ikki turdagi havolani qabul qiladi:
+    • Referal:    t.me/BOT_USERNAME?start=123456789          (foydalanuvchi ID)
+    • Kino kodi:  t.me/BOT_USERNAME?start=movie_101           (Instagram bio va h.k. uchun qulay)
+    """
     user = message.from_user
     args = command.args
     referrer_id = None
-    if args and args.isdigit():
-        referrer_id = int(args)
-        if referrer_id == user.id:
-            referrer_id = None
+    movie_code = None
+    source = None
+
+    if args:
+        if args.startswith("movie_"):
+            payload = args.split("movie_", 1)[1].strip()
+            if "_" in payload:
+                movie_code, source = payload.split("_", 1)
+            else:
+                movie_code = payload
+        elif args.isdigit():
+            referrer_id = int(args)
+            if referrer_id == user.id:
+                referrer_id = None
+
     try:
+        is_new_user = not db_execute("SELECT user_id FROM users WHERE user_id=?", (user.id,), fetchone=True)
         add_user(user.id, user.username, user.first_name, user.last_name, referrer_id)
         if user.id in ADMIN_IDS:
             set_user_status(user.id, "admin")
         await state.clear()
 
+        if movie_code and source:
+            log_action(user.id, "deeplink_source", f"code={movie_code} source={source}")
+
+        # Agar yangi foydalanuvchi referal orqali kelgan bo'lsa — referal beruvchida mukofot mezoni tekshiriladi
+        if is_new_user and referrer_id:
+            if check_and_grant_referral_reward(referrer_id):
+                plan_title = "👑 VIP" if REFERRAL_REWARD_PLAN == "vip" else "💎 PREMIUM"
+                try:
+                    await bot.send_message(
+                        referrer_id,
+                        f"🎉 Tabriklaymiz! Siz {REFERRAL_TARGET_COUNT} kishini taklif qildingiz va "
+                        f"{REFERRAL_REWARD_DAYS} kunlik {plan_title} obunani bepul qo'lga kiritdingiz!"
+                    )
+                except Exception:
+                    pass
+
         await message.answer(
             f"👋 Assalomu alaykum, {user.first_name}!\n\n"
-            f"🎬 Men <b>KODLI KINO BOT</b>man.\n"
+            f"🎬 <b>KODLI KINO BOT</b>ga xush kelibsiz!\n"
             f"🔰 Sizning holatingiz: <b>{get_user_status(user.id)}</b>\n\n"
             f"🎞 Kino ko'rish uchun kino kodini yuboring (masalan: <code>101</code>)\n"
             f"yoki quyidagi menyudan foydalaning 👇",
@@ -578,6 +664,11 @@ async def start_command(message: Message, command: CommandObject, state: FSMCont
                 "❗️ Botdan foydalanish uchun avval quyidagi kanal(lar)ga obuna bo'ling:",
                 reply_markup=subscribe_keyboard()
             )
+            return  # obuna bo'lmaguncha kino kodi ham ko'rsatilmaydi
+
+        if movie_code:
+            # Instagram/boshqa joydan kino kodi bilan to'g'ridan-to'g'ri kelgan foydalanuvchi
+            await send_movie(message, user.id, movie_code)
         else:
             await message.answer("📋 Asosiy menyu:", reply_markup=main_inline_keyboard(user.id))
     except Exception as e:
@@ -696,6 +787,16 @@ def profile_text(user_id):
         if expires_at:
             expires_date = datetime.fromisoformat(expires_at).strftime("%d.%m.%Y")
             text += f"\n📅 Obuna tugash sanasi: {expires_date}"
+
+    reward_claimed = db_execute("SELECT referral_reward_claimed FROM users WHERE user_id=?", (user_id,), fetchone=True)
+    if reward_claimed and not reward_claimed[0]:
+        ref_count = get_referral_count(user_id)
+        remaining = max(0, REFERRAL_TARGET_COUNT - ref_count)
+        plan_title = "👑 VIP" if REFERRAL_REWARD_PLAN == "vip" else "💎 PREMIUM"
+        text += (
+            f"\n\n🎁 Referal: {ref_count}/{REFERRAL_TARGET_COUNT} kishi taklif qildingiz\n"
+            f"Yana {remaining} kishi taklif qilsangiz — {REFERRAL_REWARD_DAYS} kunlik {plan_title} bepul!"
+        )
     return text
 
 # ---------- Qidiruv so'rovi ----------
@@ -839,7 +940,17 @@ async def send_movie(target_message: Message, user_id: int, code: str):
         f"⭐️ Reyting: {round(movie[10] or 0, 1)} ({movie[11] or 0} ta baho)\n"
         f"👁 Ko'rishlar: {movie[9]}"
     )
-    await target_message.answer_video(video=movie[3], caption=caption, parse_mode="HTML", reply_markup=movie_action_keyboard(code))
+    bot_info = await bot.get_me()
+    share_link = f"https://t.me/{bot_info.username}?start=movie_{code}"
+    poster_file_id = movie[12] if len(movie) > 12 else None
+    keyboard = movie_action_keyboard(code, share_link)
+
+    if poster_file_id:
+        await target_message.answer_photo(photo=poster_file_id, caption=caption, parse_mode="HTML", reply_markup=keyboard)
+        await target_message.answer_video(video=movie[3])
+    else:
+        await target_message.answer_video(video=movie[3], caption=caption, parse_mode="HTML", reply_markup=keyboard)
+
     increment_views(code)
     db_execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id=?", (user_id,), commit=True)
     log_action(user_id, "view_movie", f"code={code}")
@@ -1161,7 +1272,12 @@ async def admin_add_movie_start(call: CallbackQuery, state: FSMContext):
         if call.from_user.id not in ADMIN_IDS:
             await call.answer("⛔️ Ruxsat yo'q", show_alert=True)
             return
-        await call.message.edit_text("➕ Yangi kino qo'shish.\n\n1️⃣ Kodni kiriting (masalan: 101):")
+        suggested_code = get_next_suggested_code()
+        await call.message.edit_text(
+            f"➕ Yangi kino qo'shish.\n\n"
+            f"1️⃣ Kodni kiriting (taklif etilgan: <code>{suggested_code}</code>, xohlasangiz shu raqamni yuboring):",
+            parse_mode="HTML"
+        )
         await state.set_state(AdminStates.waiting_movie_code)
     except Exception as e:
         logging.exception(f"Admin qo'shish boshlash xatosi: {e}")
@@ -1195,17 +1311,43 @@ async def admin_add_movie_title(message: Message, state: FSMContext):
 async def admin_add_movie_desc(message: Message, state: FSMContext):
     try:
         await state.update_data(desc=message.text.strip())
-        await message.answer("4️⃣ Endi kino faylini (video) yuboring:")
-        await state.set_state(AdminStates.waiting_movie_file)
+        await message.answer(
+            "4️⃣ Kino uchun poster (afisha) rasmini yuboring.\n"
+            "Agar poster bo'lmasa — /skip deb yozing."
+        )
+        await state.set_state(AdminStates.waiting_movie_poster)
     except Exception as e:
         logging.exception(f"Admin kino tavsifi xatosi: {e}")
         await message.answer("Xatolik yuz berdi.")
+
+@dp.message(AdminStates.waiting_movie_poster, F.photo)
+async def admin_add_movie_poster(message: Message, state: FSMContext):
+    try:
+        await state.update_data(poster_file_id=message.photo[-1].file_id)
+        await message.answer("5️⃣ Endi kino faylini (video) yuboring:")
+        await state.set_state(AdminStates.waiting_movie_file)
+    except Exception as e:
+        logging.exception(f"Admin poster xatosi: {e}")
+        await message.answer("Xatolik yuz berdi.")
+
+@dp.message(AdminStates.waiting_movie_poster, Command("skip"))
+async def admin_skip_movie_poster(message: Message, state: FSMContext):
+    try:
+        await state.update_data(poster_file_id=None)
+        await message.answer("5️⃣ Endi kino faylini (video) yuboring:")
+        await state.set_state(AdminStates.waiting_movie_file)
+    except Exception as e:
+        logging.exception(f"Poster o'tkazib yuborish xatosi: {e}")
+
+@dp.message(AdminStates.waiting_movie_poster)
+async def admin_add_movie_poster_invalid(message: Message):
+    await message.answer("❗️ Iltimos, rasm yuboring yoki /skip deb yozing.")
 
 @dp.message(AdminStates.waiting_movie_file, F.video)
 async def admin_add_movie_file(message: Message, state: FSMContext):
     try:
         await state.update_data(file_id=message.video.file_id)
-        await message.answer("5️⃣ Kategoriyasini kiriting (masalan: Jangari):")
+        await message.answer("6️⃣ Kategoriyasini kiriting (masalan: Jangari):")
         await state.set_state(AdminStates.waiting_movie_category)
     except Exception as e:
         logging.exception(f"Admin kino fayl xatosi: {e}")
@@ -1244,21 +1386,48 @@ async def admin_add_movie_premium(message: Message, state: FSMContext):
     try:
         premium = message.text.lower() in ["ha", "yes", "1", "true"]
         data = await state.get_data()
+        poster_file_id = data.get("poster_file_id")
         add_movie(
             data["code"], data["title"], data["desc"], data["file_id"],
-            data["category"], data["vip"], premium, message.from_user.id
+            data["category"], data["vip"], premium, message.from_user.id, poster_file_id
         )
         vip_display = "Ha" if data["vip"] else "Yo\u02bcq"
         premium_display = "Ha" if premium else "Yo\u02bcq"
+        bot_info = await bot.get_me()
+        share_link = f"https://t.me/{bot_info.username}?start=movie_{data['code']}"
         await message.answer(
             f"✅ Kino muvaffaqiyatli qo'shildi!\n\n"
             f"🔑 Kod: {data['code']}\n"
             f"🎬 Nomi: {data['title']}\n"
             f"📂 Kategoriya: {data['category']}\n"
             f"👑 VIP: {vip_display}\n"
-            f"💎 PREMIUM: {premium_display}"
+            f"💎 PREMIUM: {premium_display}\n\n"
+            f"🔗 <b>Instagram/bio uchun havola</b> (bosilganda kino to'g'ridan-to'g'ri ochiladi):\n"
+            f"<code>{share_link}</code>",
+            parse_mode="HTML"
         )
         log_action(message.from_user.id, "add_movie", f"code={data['code']}")
+
+        # Agar majburiy e'lon kanali sozlangan bo'lsa — yangi kino haqida avtomatik post qilinadi
+        if POST_CHANNEL:
+            announce = (
+                f"🆕 <b>Yangi kino qo'shildi!</b>\n\n"
+                f"🎬 {data['title']}\n"
+                f"📝 {data['desc']}\n"
+                f"📂 {data['category']}\n\n"
+                f"🔑 Kod: <code>{data['code']}</code>"
+            )
+            announce_kb = InlineKeyboardBuilder()
+            announce_kb.button(text="🎬 Ko'rish", url=share_link)
+            try:
+                if poster_file_id:
+                    await bot.send_photo(POST_CHANNEL, poster_file_id, caption=announce, parse_mode="HTML", reply_markup=announce_kb.as_markup())
+                else:
+                    await bot.send_message(POST_CHANNEL, announce, parse_mode="HTML", reply_markup=announce_kb.as_markup())
+            except Exception as e:
+                logging.exception(f"Kanalga avtomatik post xatosi: {e}")
+                await message.answer("⚠️ Kanalga avtomatik post yuborilmadi (kanal sozlamalarini tekshiring).")
+
         await state.clear()
     except Exception as e:
         logging.exception(f"Admin kino qo'shish yakunlash xatosi: {e}")
@@ -1626,12 +1795,69 @@ async def start_web_server():
     logging.info(f"🌐 Health-check server {PORT}-portda ishga tushdi")
 
 # ============================
-# 11. BOTNI ISHGA TUSHIRISH
+# 11. FONDA ISHLAYDIGAN VAZIFALAR (background tasks)
+# ============================
+async def subscription_reminder_loop():
+    """Muddati 2 kundan kam qolgan VIP/PREMIUM foydalanuvchilarga eslatma yuboradi"""
+    while True:
+        try:
+            soon = (datetime.now() + timedelta(days=2)).isoformat()
+            rows = db_execute(
+                "SELECT user_id, status, subscription_expires_at FROM users "
+                "WHERE status IN ('vip','premium') AND subscription_expires_at IS NOT NULL "
+                "AND subscription_expires_at <= ? AND reminder_sent=0",
+                (soon,), fetchall=True
+            )
+            for user_id, status, expires_at in rows:
+                try:
+                    expires_date = datetime.fromisoformat(expires_at).strftime("%d.%m.%Y")
+                    plan_title = "👑 VIP" if status == "vip" else "💎 PREMIUM"
+                    await bot.send_message(
+                        user_id,
+                        f"⏳ Eslatma: sizning {plan_title} obunangiz {expires_date} kuni tugaydi.\n"
+                        f"Uzaytirish uchun 💳 Obuna bo'limiga o'ting."
+                    )
+                    db_execute("UPDATE users SET reminder_sent=1 WHERE user_id=?", (user_id,), commit=True)
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.exception(f"Eslatma yuborish xatosi: {e}")
+        await asyncio.sleep(6 * 60 * 60)  # har 6 soatda tekshiradi
+
+async def daily_admin_report_loop():
+    """Har 24 soatda adminlarga qisqa statistika hisobotini yuboradi"""
+    while True:
+        await asyncio.sleep(24 * 60 * 60)
+        try:
+            total_users = db_execute("SELECT COUNT(*) FROM users", fetchone=True)[0]
+            total_movies = db_execute("SELECT COUNT(*) FROM movies", fetchone=True)[0]
+            vip_count = db_execute("SELECT COUNT(*) FROM users WHERE status='vip'", fetchone=True)[0]
+            premium_count = db_execute("SELECT COUNT(*) FROM users WHERE status='premium'", fetchone=True)[0]
+            pending = len(get_pending_payments())
+            report = (
+                f"📊 <b>Kunlik hisobot</b>\n\n"
+                f"👥 Foydalanuvchilar: {total_users}\n"
+                f"🎬 Kinolar: {total_movies}\n"
+                f"👑 VIP: {vip_count} | 💎 PREMIUM: {premium_count}\n"
+                f"💳 Kutilayotgan to'lovlar: {pending}"
+            )
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(admin_id, report, parse_mode="HTML")
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.exception(f"Kunlik hisobot xatosi: {e}")
+
+# ============================
+# 12. BOTNI ISHGA TUSHIRISH
 # ============================
 async def main():
     logging.basicConfig(level=logging.INFO)
     print("🤖 Bot ishga tushmoqda...")
     await start_web_server()
+    asyncio.create_task(subscription_reminder_loop())
+    asyncio.create_task(daily_admin_report_loop())
     await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
