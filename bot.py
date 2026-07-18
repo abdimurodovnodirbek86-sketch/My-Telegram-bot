@@ -20,18 +20,19 @@ from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.enums import ChatMemberStatus
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup,
-    InlineKeyboardButton, CallbackQuery, Message, ChatMemberStatus
+    InlineKeyboardButton, CallbackQuery, Message
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 # ============================
 # 1. KONFIGURATSIYA
 # ============================
-# Render'da bu qiymatlar Dashboard -> Environment bo'limidan kiritiladi.
-# Lokal (Termux) test uchun pastdagi standart qiymatlarni o'zgartirishingiz mumkin.
-BOT_TOKEN = os.getenv("8492424383:AAFoAmLdvquiP0JwFUYE2grgyF2d2zQREUA", "YOUR_BOT_TOKEN_HERE")
+# Render'da bu qiymatlarni Dashboard -> Environment bo'limidan ham boshqarish mumkin
+# (agar shu yerda environment variable topilmasa, pastdagi standart qiymat ishlatiladi).
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8492424383:AAFoAmLdvquiP0JwFUYE2grgyF2d2zQREUA")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "8283067497").split(",") if x.strip()]
 PORT = int(os.getenv("PORT", 10000))  # Render avtomatik PORT beradi
 
