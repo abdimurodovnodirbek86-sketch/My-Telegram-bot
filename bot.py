@@ -569,6 +569,17 @@ def subscription_plans_keyboard():
     builder.row(InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_main"))
     return builder.as_markup()
 
+def upsell_keyboard(plan):
+    """Qulflangan kino uchun to'g'ridan-to'g'ri sotib olish tugmasi"""
+    builder = InlineKeyboardBuilder()
+    if plan == "vip":
+        builder.button(text=f"👑 VIP sotib olish — {VIP_PRICE:,} so'm/oy".replace(",", " "), callback_data="buy_vip")
+    else:
+        builder.button(text=f"💎 PREMIUM sotib olish — {PREMIUM_PRICE:,} so'm/oy".replace(",", " "), callback_data="buy_premium")
+    builder.button(text="📋 Boshqa rejalar", callback_data="subscription_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
 def payment_cancel_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="❌ Bekor qilish", callback_data="subscription_menu")
@@ -928,10 +939,26 @@ async def send_movie(target_message: Message, user_id: int, code: str):
 
     status = get_user_status(user_id)
     if movie[5] and status not in ["vip", "premium", "admin"]:
-        await target_message.answer("👑 Bu kino faqat VIP foydalanuvchilar uchun!")
+        await target_message.answer(
+            f"🔒 <b>«{movie[1]}»</b> — bu kino faqat 👑 VIP obunachilar uchun ochiq!\n\n"
+            f"👑 VIP obuna — atigi {VIP_PRICE:,} so'm/oy".replace(",", " ") + "\n"
+            f"✅ Barcha VIP kinolarga to'liq kirish\n"
+            f"✅ Cheklovlarsiz tomosha qiling\n\n"
+            f"👇 Hozir sotib oling va kinoni darhol ko'ring:",
+            parse_mode="HTML",
+            reply_markup=upsell_keyboard("vip")
+        )
         return
     if movie[6] and status not in ["premium", "admin"]:
-        await target_message.answer("💎 Bu kino faqat PREMIUM foydalanuvchilar uchun!")
+        await target_message.answer(
+            f"🔒 <b>«{movie[1]}»</b> — bu kino faqat 💎 PREMIUM obunachilar uchun ochiq!\n\n"
+            f"💎 PREMIUM obuna — atigi {PREMIUM_PRICE:,} so'm/oy".replace(",", " ") + "\n"
+            f"✅ Barcha VIP va PREMIUM kinolarga to'liq kirish\n"
+            f"✅ Eng so'nggi va eksklyuziv kinolar\n\n"
+            f"👇 Hozir sotib oling va kinoni darhol ko'ring:",
+            parse_mode="HTML",
+            reply_markup=upsell_keyboard("premium")
+        )
         return
 
     caption = (
