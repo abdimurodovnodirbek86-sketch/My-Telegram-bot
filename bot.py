@@ -52,6 +52,13 @@ REFERRAL_REWARD_PLAN = "vip"                                      # qaysi status
 # --- Yangi kino qo'shilganda avtomatik e'lon qilinadigan kanal (ixtiyoriy) ---
 POST_CHANNEL = os.getenv("POST_CHANNEL", "")                      # masalan: @kino_yangiliklari
 
+# --- Faqat VIP/PREMIUM to'lagan foydalanuvchilar kira oladigan yopiq kanal (ixtiyoriy) ---
+# Bot shu kanalda ADMIN bo'lishi va "Invite users via link" + "Ban users" huquqiga ega bo'lishi shart.
+VIP_CHANNEL_ID = os.getenv("VIP_CHANNEL_ID", "")                  # masalan: -1001234567890
+
+# --- Barcha kino/serial kodlari ro'yxati avtomatik joylanadigan ochiq katalog kanal (ixtiyoriy) ---
+CATALOG_CHANNEL = os.getenv("CATALOG_CHANNEL", "")                # masalan: @kino_kodlari_katalog
+
 # ============================
 # 2. SQLite BAZA (DB)
 # ============================
@@ -135,6 +142,30 @@ def init_db():
         requested_at TEXT DEFAULT CURRENT_TIMESTAMP,
         decided_at TEXT,
         decided_by INTEGER
+    )''')
+
+    # Seriallar jadvali
+    c.execute('''CREATE TABLE IF NOT EXISTS series (
+        code TEXT PRIMARY KEY,
+        title TEXT,
+        description TEXT,
+        poster_file_id TEXT,
+        category TEXT,
+        is_vip BOOLEAN DEFAULT 0,
+        is_premium BOOLEAN DEFAULT 0,
+        free_episodes INTEGER DEFAULT 0,
+        added_by INTEGER,
+        added_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+
+    # Serial qismlari (epizodlar) jadvali
+    c.execute('''CREATE TABLE IF NOT EXISTS episodes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        series_code TEXT,
+        episode_number INTEGER,
+        file_id TEXT,
+        added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(series_code, episode_number)
     )''')
 
     conn.commit()
@@ -393,8 +424,89 @@ def get_pending_payments():
     return db_execute("SELECT id, user_id, plan, amount, requested_at FROM payments WHERE status='pending' ORDER BY requested_at ASC", fetchall=True)
 
 # ------------------------------
-# Majburiy obuna kanallari (DB orqali doimiy saqlanadi)
+# Seriallar va epizodlar bilan bog'liq funksiyalar
 # ------------------------------
+def add_series(code, title, description, category, is_vip, is_premium, free_episodes, added_by, poster_file_id=None):
+    db_execute(
+        "INSERT OR REPLACE INTO series (code, title, description, poster_file_id, category, is_vip, is_premium, free_episodes, added_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (code, title, description, poster_file_id, category, is_vip, is_premium, free_episodes, added_by),
+        commit=True
+    )
+
+def get_series(code):
+    return db_execute("SELECT * FROM series WHERE code=?", (code,), fetchone=True)
+
+def get_all_series():
+    return db_execute("SELECT code, title FROM series ORDER BY added_at DESC", fetchall=True)
+
+def add_episode(series_code, episode_number, file_id):
+    db_execute(
+        "INSERT OR REPLACE INTO episodes (series_code, episode_number, file_id) VALUES (?, ?, ?)",
+        (series_code, episode_number, file_id),
+        commit=True
+    )
+
+def get_episode(series_code, episode_number):
+    return db_execute(
+        "SELECT * FROM episodes WHERE series_code=? AND episode_number=?",
+        (series_code, episode_number), fetchone=True
+    )
+
+def get_episode_numbers(series_code):
+    rows = db_execute(
+        "SELECT episode_number FROM episodes WHERE series_code=? ORDER BY episode_number ASC",
+        (series_code,), fetchall=True
+    )
+    return [r[0] for r in rows]
+
+# ------------------------------
+# VIP yopiq kanalga avtomatik kirish/chiqish
+# ------------------------------
+async def grant_vip_channel_access(user_id):
+    """Foydalanuvchiga VIP yopiq kanalga bir martalik, muddatli taklif havolasini yuboradi"""
+    if not VIP_CHANNEL_ID:
+        return
+    try:
+        expire_ts = int((datetime.now() + timedelta(hours=24)).timestamp())
+        invite = await bot.create_chat_invite_link(chat_id=VIP_CHANNEL_ID, member_limit=1, expire_date=expire_ts)
+        await bot.send_message(
+            user_id,
+            f"🔐 <b>VIP yopiq kanalga qo'shilish havolasi:</b>\n{invite.invite_link}\n\n"
+            f"⚠️ Havola faqat 24 soat va 1 kishi uchun amal qiladi.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.exception(f"VIP kanalga taklif xatosi (user={user_id}): {e}")
+
+async def revoke_vip_channel_access(user_id):
+    """Obunasi tugagan foydalanuvchini VIP kanaldan chiqaradi (ban+unban = oddiy kick)"""
+    if not VIP_CHANNEL_ID:
+        return
+    try:
+        await bot.ban_chat_member(chat_id=VIP_CHANNEL_ID, user_id=user_id)
+        await bot.unban_chat_member(chat_id=VIP_CHANNEL_ID, user_id=user_id, only_if_banned=True)
+    except Exception as e:
+        logging.exception(f"VIP kanaldan chiqarish xatosi (user={user_id}): {e}")
+
+async def post_to_catalog(code, title, deep_link, is_series=False):
+    """Yangi kino/serial qo'shilganda ochiq katalog kanalga qisqa yozuv joylaydi"""
+    if not CATALOG_CHANNEL:
+        return
+    try:
+        icon = "🎞" if is_series else "🎬"
+        kb = InlineKeyboardBuilder()
+        kb.button(text="▶️ Ko'rish", url=deep_link)
+        await bot.send_message(
+            CATALOG_CHANNEL,
+            f"{icon} <b>{title}</b>\n🔑 Kod: <code>{code}</code>",
+            parse_mode="HTML",
+            reply_markup=kb.as_markup()
+        )
+    except Exception as e:
+        logging.exception(f"Katalog kanalga post xatosi: {e}")
+
+
 def get_channels():
     row = db_execute("SELECT value FROM settings WHERE key='channels'", fetchone=True)
     if row:
@@ -456,6 +568,17 @@ class AdminStates(StatesGroup):
     waiting_search_query = State()
     waiting_ban_user = State()
     waiting_payment_screenshot = State()
+    waiting_series_code = State()
+    waiting_series_title = State()
+    waiting_series_desc = State()
+    waiting_series_poster = State()
+    waiting_series_category = State()
+    waiting_series_vip = State()
+    waiting_series_premium = State()
+    waiting_series_free_count = State()
+    waiting_episode_series_code = State()
+    waiting_episode_number = State()
+    waiting_episode_video = State()
 
 # ============================
 # 6. KLAVIATURALAR
@@ -495,6 +618,8 @@ def admin_panel_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="➕ Kino qo'shish", callback_data="admin_add_movie")
     builder.button(text="➖ Kino o'chirish", callback_data="admin_delete_movie")
+    builder.button(text="🎞 Serial qo'shish", callback_data="admin_add_series")
+    builder.button(text="➕ Epizod qo'shish", callback_data="admin_add_episode")
     builder.button(text="📊 Statistika", callback_data="admin_stats")
     builder.button(text="📢 Broadcast", callback_data="admin_broadcast")
     builder.button(text="👑 Status berish", callback_data="admin_give_status")
@@ -587,6 +712,16 @@ def upsell_keyboard(plan):
     builder.adjust(1)
     return builder.as_markup()
 
+def episode_list_keyboard(series_code, episode_numbers, free_episodes):
+    """Serial qismlari ro'yxati — pullik qismlar 🔒 belgisi bilan ko'rsatiladi"""
+    builder = InlineKeyboardBuilder()
+    for ep in episode_numbers:
+        lock = "" if ep <= free_episodes else "🔒 "
+        builder.button(text=f"{lock}{ep}-qism", callback_data=f"episode_{series_code}_{ep}")
+    builder.adjust(4)
+    builder.row(InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_main"))
+    return builder.as_markup()
+
 def payment_cancel_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="❌ Bekor qilish", callback_data="subscription_menu")
@@ -622,14 +757,16 @@ dp = Dispatcher(storage=storage)
 @dp.message(Command("start"))
 async def start_command(message: Message, command: CommandObject, state: FSMContext):
     """Botni ishga tushiruvchi asosiy komanda.
-    Ikki turdagi havolani qabul qiladi:
+    Uch turdagi havolani qabul qiladi:
     • Referal:    t.me/BOT_USERNAME?start=123456789          (foydalanuvchi ID)
     • Kino kodi:  t.me/BOT_USERNAME?start=movie_101           (Instagram bio va h.k. uchun qulay)
+    • Serial kodi: t.me/BOT_USERNAME?start=series_S101
     """
     user = message.from_user
     args = command.args
     referrer_id = None
     movie_code = None
+    series_code = None
     source = None
 
     if args:
@@ -639,6 +776,8 @@ async def start_command(message: Message, command: CommandObject, state: FSMCont
                 movie_code, source = payload.split("_", 1)
             else:
                 movie_code = payload
+        elif args.startswith("series_"):
+            series_code = args.split("series_", 1)[1].strip()
         elif args.isdigit():
             referrer_id = int(args)
             if referrer_id == user.id:
@@ -666,6 +805,7 @@ async def start_command(message: Message, command: CommandObject, state: FSMCont
                     )
                 except Exception:
                     pass
+                await grant_vip_channel_access(referrer_id)
 
         await message.answer(
             f"👋 Assalomu alaykum, {user.first_name}!\n\n"
@@ -687,6 +827,8 @@ async def start_command(message: Message, command: CommandObject, state: FSMCont
         if movie_code:
             # Instagram/boshqa joydan kino kodi bilan to'g'ridan-to'g'ri kelgan foydalanuvchi
             await send_movie(message, user.id, movie_code)
+        elif series_code:
+            await send_series(message, user.id, series_code)
         else:
             await message.answer("📋 Asosiy menyu:", reply_markup=main_inline_keyboard(user.id))
     except Exception as e:
@@ -941,7 +1083,11 @@ async def send_movie(target_message: Message, user_id: int, code: str):
 
     movie = get_movie(code)
     if not movie:
-        await target_message.answer("❌ Bunday kodli kino topilmadi. Kodni tekshirib qayta yuboring.")
+        series = get_series(code)
+        if series:
+            await send_series(target_message, user_id, code)
+            return
+        await target_message.answer("❌ Bunday kodli kino yoki serial topilmadi. Kodni tekshirib qayta yuboring.")
         return
 
     status = get_user_status(user_id)
@@ -988,6 +1134,98 @@ async def send_movie(target_message: Message, user_id: int, code: str):
     increment_views(code)
     db_execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id=?", (user_id,), commit=True)
     log_action(user_id, "view_movie", f"code={code}")
+
+async def send_series(target_message: Message, user_id: int, code: str):
+    """Serial haqida ma'lumot va epizodlar ro'yxatini ko'rsatadi"""
+    if is_user_banned(user_id):
+        await target_message.answer("🚫 Siz botdan foydalanish huquqidan mahrum qilingansiz.")
+        return
+    if not await is_subscribed(user_id, bot):
+        await target_message.answer("❗️ Iltimos, avval kanal(lar)ga obuna bo'ling.", reply_markup=subscribe_keyboard())
+        return
+
+    series = get_series(code)
+    if not series:
+        await target_message.answer("❌ Bunday kodli serial topilmadi.")
+        return
+
+    episode_numbers = get_episode_numbers(code)
+    if not episode_numbers:
+        await target_message.answer("⏳ Bu serialga hali qismlar yuklanmagan. Keyinroq qayta urinib ko'ring.")
+        return
+
+    free_episodes = series[7] or 0
+    free_line = f"🆓 Bepul qismlar: 1—{free_episodes}" if free_episodes > 0 else "🔒 Barcha qismlar pullik"
+    caption = (
+        f"🎞 <b>{series[1]}</b>\n"
+        f"📝 {series[2]}\n"
+        f"📂 {series[4]}\n"
+        f"{free_line}\n\n"
+        f"👇 Qismni tanlang:"
+    )
+    keyboard = episode_list_keyboard(code, episode_numbers, free_episodes)
+    poster_file_id = series[3]
+    if poster_file_id:
+        await target_message.answer_photo(photo=poster_file_id, caption=caption, parse_mode="HTML", reply_markup=keyboard)
+    else:
+        await target_message.answer(caption, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("episode_"))
+async def episode_detail(call: CallbackQuery):
+    try:
+        user_id = call.from_user.id
+        parts = call.data.split("_")
+        episode_number = int(parts[-1])
+        series_code = "_".join(parts[1:-1])
+
+        if is_user_banned(user_id):
+            await call.answer("🚫 Siz bloklangansiz.", show_alert=True)
+            return
+        if not check_spam(user_id):
+            await call.answer("⏳ Juda ko'p so'rov. Bir daqiqa kuting.", show_alert=True)
+            return
+
+        series = get_series(series_code)
+        if not series:
+            await call.answer("❌ Serial topilmadi.", show_alert=True)
+            return
+
+        free_episodes = series[7] or 0
+        requires_premium = bool(series[6])
+        status = get_user_status(user_id)
+        locked = episode_number > free_episodes
+
+        if locked:
+            allowed_statuses = ["premium", "admin"] if requires_premium else ["vip", "premium", "admin"]
+            if status not in allowed_statuses:
+                plan = "premium" if requires_premium else "vip"
+                plan_title = "💎 PREMIUM" if plan == "premium" else "👑 VIP"
+                price = PREMIUM_PRICE if plan == "premium" else VIP_PRICE
+                await call.message.answer(
+                    f"🔒 <b>«{series[1]}»</b> {episode_number}-qismi faqat {plan_title} obunachilar uchun ochiq!\n\n"
+                    f"{plan_title} obuna — atigi {price:,} so'm/oy".replace(",", " ") + "\n"
+                    f"✅ Ushbu serialning barcha qismlariga to'liq kirish\n\n"
+                    f"👇 Hozir sotib oling va darhol tomosha qiling:",
+                    parse_mode="HTML",
+                    reply_markup=upsell_keyboard(plan)
+                )
+                await call.answer()
+                return
+
+        episode = get_episode(series_code, episode_number)
+        if not episode:
+            await call.answer("❌ Bu qism topilmadi.", show_alert=True)
+            return
+
+        await call.message.answer_video(
+            video=episode[3],
+            caption=f"🎞 <b>{series[1]}</b> — {episode_number}-qism"
+        , parse_mode="HTML")
+        log_action(user_id, "view_episode", f"series={series_code} ep={episode_number}")
+    except Exception as e:
+        logging.exception(f"Epizod ko'rsatish xatosi: {e}")
+        await call.answer("Xatolik yuz berdi.", show_alert=True)
+    await call.answer()
 
 @dp.callback_query(F.data.startswith("movie_"))
 async def movie_detail(call: CallbackQuery):
@@ -1226,6 +1464,7 @@ async def approve_payment(call: CallbackQuery):
             )
         except Exception:
             pass
+        await grant_vip_channel_access(user_id)
 
         await call.message.edit_caption(caption=call.message.caption + "\n\n✅ <b>TASDIQLANDI</b>", parse_mode="HTML")
     except Exception as e:
@@ -1462,11 +1701,213 @@ async def admin_add_movie_premium(message: Message, state: FSMContext):
                 logging.exception(f"Kanalga avtomatik post xatosi: {e}")
                 await message.answer("⚠️ Kanalga avtomatik post yuborilmadi (kanal sozlamalarini tekshiring).")
 
+        await post_to_catalog(data['code'], data['title'], share_link, is_series=False)
         await state.clear()
     except Exception as e:
         logging.exception(f"Admin kino qo'shish yakunlash xatosi: {e}")
         await message.answer("Xatolik yuz berdi.")
         await state.clear()
+
+# ---------- Serial qo'shish ----------
+@dp.callback_query(F.data == "admin_add_series")
+async def admin_add_series_start(call: CallbackQuery, state: FSMContext):
+    try:
+        if call.from_user.id not in ADMIN_IDS:
+            await call.answer("⛔️ Ruxsat yo'q", show_alert=True)
+            return
+        await call.message.edit_text("🎞 Yangi serial qo'shish.\n\n1️⃣ Serial kodini kiriting (masalan: S101):")
+        await state.set_state(AdminStates.waiting_series_code)
+    except Exception as e:
+        logging.exception(f"Serial qo'shish boshlash xatosi: {e}")
+    await call.answer()
+
+@dp.message(AdminStates.waiting_series_code)
+async def admin_add_series_code(message: Message, state: FSMContext):
+    try:
+        code = message.text.strip()
+        if get_series(code) or get_movie(code):
+            await message.answer("❌ Bu kod allaqachon mavjud (kino yoki serial sifatida). Boshqa kod kiriting.")
+            return
+        await state.update_data(code=code)
+        await message.answer("2️⃣ Serial nomini kiriting:")
+        await state.set_state(AdminStates.waiting_series_title)
+    except Exception as e:
+        logging.exception(f"Serial kodi xatosi: {e}")
+        await message.answer("Xatolik yuz berdi.")
+
+@dp.message(AdminStates.waiting_series_title)
+async def admin_add_series_title(message: Message, state: FSMContext):
+    try:
+        await state.update_data(title=message.text.strip())
+        await message.answer("3️⃣ Serial tavsifini kiriting:")
+        await state.set_state(AdminStates.waiting_series_desc)
+    except Exception as e:
+        logging.exception(f"Serial nomi xatosi: {e}")
+        await message.answer("Xatolik yuz berdi.")
+
+@dp.message(AdminStates.waiting_series_desc)
+async def admin_add_series_desc(message: Message, state: FSMContext):
+    try:
+        await state.update_data(desc=message.text.strip())
+        await message.answer("4️⃣ Serial uchun poster rasm yuboring (yoki /skip):")
+        await state.set_state(AdminStates.waiting_series_poster)
+    except Exception as e:
+        logging.exception(f"Serial tavsifi xatosi: {e}")
+        await message.answer("Xatolik yuz berdi.")
+
+@dp.message(AdminStates.waiting_series_poster, F.photo)
+async def admin_add_series_poster(message: Message, state: FSMContext):
+    try:
+        await state.update_data(poster_file_id=message.photo[-1].file_id)
+        await message.answer("5️⃣ Kategoriyasini kiriting (masalan: Turk seriali):")
+        await state.set_state(AdminStates.waiting_series_category)
+    except Exception as e:
+        logging.exception(f"Serial poster xatosi: {e}")
+        await message.answer("Xatolik yuz berdi.")
+
+@dp.message(AdminStates.waiting_series_poster, Command("skip"))
+async def admin_skip_series_poster(message: Message, state: FSMContext):
+    try:
+        await state.update_data(poster_file_id=None)
+        await message.answer("5️⃣ Kategoriyasini kiriting (masalan: Turk seriali):")
+        await state.set_state(AdminStates.waiting_series_category)
+    except Exception as e:
+        logging.exception(f"Serial poster o'tkazish xatosi: {e}")
+
+@dp.message(AdminStates.waiting_series_poster)
+async def admin_add_series_poster_invalid(message: Message):
+    await message.answer("❗️ Iltimos, rasm yuboring yoki /skip deb yozing.")
+
+@dp.message(AdminStates.waiting_series_category)
+async def admin_add_series_category(message: Message, state: FSMContext):
+    try:
+        category = message.text.strip()
+        add_category(category, "📁")
+        await state.update_data(category=category)
+        await message.answer("6️⃣ Pullik qismlar VIP darajasidami yoki PREMIUM darajasidami? (vip/premium):")
+        await state.set_state(AdminStates.waiting_series_vip)
+    except Exception as e:
+        logging.exception(f"Serial kategoriyasi xatosi: {e}")
+        await message.answer("Xatolik yuz berdi.")
+
+@dp.message(AdminStates.waiting_series_vip)
+async def admin_add_series_vip(message: Message, state: FSMContext):
+    try:
+        answer = message.text.strip().lower()
+        is_premium_series = answer == "premium"
+        await state.update_data(is_vip=True, is_premium=is_premium_series)
+        await message.answer(
+            "7️⃣ Necha qismgacha BEPUL bo'lsin? (masalan: 3)\n"
+            "Shu raqamdan keyingi qismlar avtomatik pullik bo'ladi."
+        )
+        await state.set_state(AdminStates.waiting_series_free_count)
+    except Exception as e:
+        logging.exception(f"Serial VIP/PREMIUM tanlash xatosi: {e}")
+        await message.answer("Xatolik yuz berdi.")
+
+@dp.message(AdminStates.waiting_series_free_count)
+async def admin_add_series_free_count(message: Message, state: FSMContext):
+    try:
+        text = message.text.strip()
+        if not text.isdigit():
+            await message.answer("❗️ Iltimos, raqam kiriting (masalan: 3).")
+            return
+        free_count = int(text)
+        data = await state.get_data()
+        add_series(
+            data["code"], data["title"], data["desc"], data["category"],
+            data["is_vip"], data["is_premium"], free_count,
+            message.from_user.id, data.get("poster_file_id")
+        )
+        bot_info = await bot.get_me()
+        share_link = f"https://t.me/{bot_info.username}?start=series_{data['code']}"
+        plan_title = "💎 PREMIUM" if data["is_premium"] else "👑 VIP"
+        await message.answer(
+            f"✅ Serial muvaffaqiyatli qo'shildi!\n\n"
+            f"🔑 Kod: {data['code']}\n"
+            f"🎞 Nomi: {data['title']}\n"
+            f"🆓 Bepul qismlar: 1—{free_count}\n"
+            f"🔒 {free_count}-dan keyingi qismlar: {plan_title}\n\n"
+            f"🔗 Havola: <code>{share_link}</code>\n\n"
+            f"Endi \"➕ Epizod qo'shish\" orqali qismlarni yuklang.",
+            parse_mode="HTML"
+        )
+        log_action(message.from_user.id, "add_series", f"code={data['code']}")
+        await post_to_catalog(data["code"], data["title"], share_link, is_series=True)
+        await state.clear()
+    except Exception as e:
+        logging.exception(f"Serial yakunlash xatosi: {e}")
+        await message.answer("Xatolik yuz berdi.")
+        await state.clear()
+
+# ---------- Epizod qo'shish ----------
+@dp.callback_query(F.data == "admin_add_episode")
+async def admin_add_episode_start(call: CallbackQuery, state: FSMContext):
+    try:
+        if call.from_user.id not in ADMIN_IDS:
+            await call.answer("⛔️ Ruxsat yo'q", show_alert=True)
+            return
+        all_series = get_all_series()
+        if not all_series:
+            await call.message.edit_text("❌ Hozircha hech qanday serial qo'shilmagan. Avval serial qo'shing.", reply_markup=admin_panel_keyboard())
+            return
+        series_list = "\n".join([f"• {title} — {code}" for code, title in all_series])
+        await call.message.edit_text(f"➕ Epizod qo'shish.\n\nMavjud seriallar:\n{series_list}\n\n1️⃣ Serial kodini kiriting:")
+        await state.set_state(AdminStates.waiting_episode_series_code)
+    except Exception as e:
+        logging.exception(f"Epizod qo'shish boshlash xatosi: {e}")
+    await call.answer()
+
+@dp.message(AdminStates.waiting_episode_series_code)
+async def admin_add_episode_series_code(message: Message, state: FSMContext):
+    try:
+        code = message.text.strip()
+        series = get_series(code)
+        if not series:
+            await message.answer("❌ Bunday kodli serial topilmadi. Qaytadan kiriting.")
+            return
+        await state.update_data(series_code=code)
+        existing = get_episode_numbers(code)
+        existing_text = f"Mavjud qismlar: {', '.join(map(str, existing))}" if existing else "Hali qism yuklanmagan."
+        await message.answer(f"2️⃣ Qism raqamini kiriting (masalan: 1).\n{existing_text}")
+        await state.set_state(AdminStates.waiting_episode_number)
+    except Exception as e:
+        logging.exception(f"Epizod serial kodi xatosi: {e}")
+        await message.answer("Xatolik yuz berdi.")
+
+@dp.message(AdminStates.waiting_episode_number)
+async def admin_add_episode_number(message: Message, state: FSMContext):
+    try:
+        text = message.text.strip()
+        if not text.isdigit():
+            await message.answer("❗️ Iltimos, raqam kiriting (masalan: 1).")
+            return
+        await state.update_data(episode_number=int(text))
+        await message.answer("3️⃣ Endi shu qismning video faylini yuboring:")
+        await state.set_state(AdminStates.waiting_episode_video)
+    except Exception as e:
+        logging.exception(f"Epizod raqami xatosi: {e}")
+        await message.answer("Xatolik yuz berdi.")
+
+@dp.message(AdminStates.waiting_episode_video, F.video)
+async def admin_add_episode_video(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        add_episode(data["series_code"], data["episode_number"], message.video.file_id)
+        await message.answer(
+            f"✅ {data['episode_number']}-qism qo'shildi!\n\n"
+            f"Yana qism qo'shishni xohlasangiz, qayta \"➕ Epizod qo'shish\" tugmasini bosing."
+        )
+        log_action(message.from_user.id, "add_episode", f"series={data['series_code']} ep={data['episode_number']}")
+        await state.clear()
+    except Exception as e:
+        logging.exception(f"Epizod video xatosi: {e}")
+        await message.answer("Xatolik yuz berdi.")
+        await state.clear()
+
+@dp.message(AdminStates.waiting_episode_video)
+async def admin_add_episode_video_invalid(message: Message):
+    await message.answer("❗️ Iltimos, video fayl yuboring.")
 
 # ---------- Kino o'chirish ----------
 @dp.callback_query(F.data == "admin_delete_movie")
@@ -1842,74 +2283,4 @@ async def subscription_reminder_loop():
                 "AND subscription_expires_at <= ? AND reminder_sent=0",
                 (soon,), fetchall=True
             )
-            for user_id, status, expires_at in rows:
-                try:
-                    expires_date = datetime.fromisoformat(expires_at).strftime("%d.%m.%Y")
-                    plan_title = "👑 VIP" if status == "vip" else "💎 PREMIUM"
-                    await bot.send_message(
-                        user_id,
-                        f"⏳ Eslatma: sizning {plan_title} obunangiz {expires_date} kuni tugaydi.\n"
-                        f"Uzaytirish uchun 💳 Obuna bo'limiga o'ting."
-                    )
-                    db_execute("UPDATE users SET reminder_sent=1 WHERE user_id=?", (user_id,), commit=True)
-                except Exception:
-                    pass
-        except Exception as e:
-            logging.exception(f"Eslatma yuborish xatosi: {e}")
-        await asyncio.sleep(6 * 60 * 60)  # har 6 soatda tekshiradi
-
-async def daily_admin_report_loop():
-    """Har 24 soatda adminlarga qisqa statistika hisobotini yuboradi"""
-    while True:
-        await asyncio.sleep(24 * 60 * 60)
-        try:
-            total_users = db_execute("SELECT COUNT(*) FROM users", fetchone=True)[0]
-            total_movies = db_execute("SELECT COUNT(*) FROM movies", fetchone=True)[0]
-            vip_count = db_execute("SELECT COUNT(*) FROM users WHERE status='vip'", fetchone=True)[0]
-            premium_count = db_execute("SELECT COUNT(*) FROM users WHERE status='premium'", fetchone=True)[0]
-            pending = len(get_pending_payments())
-            report = (
-                f"📊 <b>Kunlik hisobot</b>\n\n"
-                f"👥 Foydalanuvchilar: {total_users}\n"
-                f"🎬 Kinolar: {total_movies}\n"
-                f"👑 VIP: {vip_count} | 💎 PREMIUM: {premium_count}\n"
-                f"💳 Kutilayotgan to'lovlar: {pending}"
-            )
-            for admin_id in ADMIN_IDS:
-                try:
-                    await bot.send_message(admin_id, report, parse_mode="HTML")
-                except Exception:
-                    pass
-        except Exception as e:
-            logging.exception(f"Kunlik hisobot xatosi: {e}")
-
-async def self_ping_loop():
-    """Render bepul instansi uxlab qolmasligi uchun bot o'zi o'ziga har 5 daqiqada so'rov yuboradi.
-    Render avtomatik beradigan RENDER_EXTERNAL_URL dan foydalanadi (yoki SELF_URL orqali qo'lda sozlash mumkin)."""
-    self_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL")
-    if not self_url:
-        logging.info("ℹ️ SELF_URL/RENDER_EXTERNAL_URL topilmadi — o'z-o'zini uyg'otish o'chirilgan.")
-        return
-    async with ClientSession() as session:
-        while True:
-            await asyncio.sleep(5 * 60)  # har 5 daqiqada
-            try:
-                async with session.get(self_url, timeout=ClientTimeout(total=20)) as resp:
-                    logging.info(f"🔁 Self-ping: {resp.status}")
-            except Exception as e:
-                logging.warning(f"Self-ping xatosi: {e}")
-
-# ============================
-# 12. BOTNI ISHGA TUSHIRISH
-# ============================
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    print("🤖 Bot ishga tushmoqda...")
-    await start_web_server()
-    asyncio.create_task(subscription_reminder_loop())
-    asyncio.create_task(daily_admin_report_loop())
-    asyncio.create_task(self_ping_loop())
-    await dp.start_polling(bot, skip_updates=True)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            for user_id, status, expires_at in ro
