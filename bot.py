@@ -6474,11 +6474,16 @@ class ContestStates(StatesGroup):
     waiting_prize_desc = State()
     waiting_banner = State()
 
-@dp.message(Command("startcontest"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+# 6477-satrdan boshlab quyidagicha almashtiring:
+@dp.message(Command("startcontest", ignore_case=True))
 async def cmd_startcontest(message: Message, state: FSMContext):
+    # Adminlikni ishonchli tekshirish (Render paneldagi ADMIN_IDS ni ham, qo'lda yozilganini ham tekshiradi)
     if message.from_user.id not in ADMIN_IDS:
+        await message.reply("❌ Siz ushbu bot admini emassiz!")
         return
+
     existing = get_active_contest(message.chat.id)
+
     if existing:
         await message.reply("⚠️ Bu guruhda allaqachon faol konkurs bor. Avval /endcontest bilan yakunlang.")
         return
