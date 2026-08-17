@@ -72,7 +72,7 @@ USERBOT_PHONE_REGEX = re.compile(r"^\+[1-9]\d{7,14}$")
 # ============================
 # Render'da bu qiymatlarni Dashboard -> Environment bo'limidan ham boshqarish mumkin
 # (agar shu yerda environment variable topilmasa, pastdagi standart qiymat ishlatiladi).
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8492424383:AAFoAmLdvquiP0JwFUYE2grgyF2d2zQREUA")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8492424383:AAHUBOW8TA0_oBS4q1ht71ZMDGd-tjSa4Eo ")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "8283067497,5153285706").split(",") if x.strip()]
 PORT = int(os.getenv("PORT", 10000))  # Render avtomatik PORT beradi
 
